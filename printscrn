@@ -1,0 +1,180 @@
+// ==UserScript==
+// @name         Disable site print/PrintKey detection
+// @namespace    https://example.local/
+// @version      1.0
+// @description  Prevent sites from detecting Ctrl+P / PrintScreen / beforeprint / matchMedia('print') and similar client-side print-detection hooks.
+// @match        *://*/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // --- Helper: swallow print-related keyboard combos (capture phase) ---
+  function swallowIfPrintKey(e) {
+    try {
+      // Common print combos:
+      //  - Ctrl+P / Cmd+P
+      //  - PrintScreen key (key === "PrintScreen" or keyCode === 44)
+      // Also block Shift+F10 / context menu? (not included by default)
+      const key = e.key || '';
+      const code = e.keyCode || e.which || 0;
+      const isCtrlPCmdP = (e.ctrlKey || e.metaKey) && (key === 'p' || key === 'P' || code === 80);
+      const isPrintScreen = key === 'PrintScreen' || code === 44;
+
+      if (isCtrlPCmdP || isPrintScreen) {
+        // Prevent site listeners from seeing it
+        e.stopImmediatePropagation();
+        // Prevent default so browser print dialog might still open for Ctrl+P — comment this line
+        // if you want to allow printing while only hiding detection.
+        // e.preventDefault();
+        return;
+      }
+    } catch (err) {
+      // ignore
+    }
+  }
+
+  // Attach capture-phase listeners early to block site handlers added later.
+  window.addEventListener('keydown', swallowIfPrintKey, true);
+  window.addEventListener('keyup', swallowIfPrintKey, true);
+  document.addEventListener('keydown', swallowIfPrintKey, true);
+  document.addEventListener('keyup', swallowIfPrintKey, true);
+
+  // --- Block beforeprint / afterprint handlers set as properties ---
+  try {
+    Object.defineProperty(window, 'onbeforeprint', {
+      configurable: true,
+      enumerable: true,
+      get: function () { return null; },
+      set: function (_) { /* ignore */ }
+    });
+    Object.defineProperty(window, 'onafterprint', {
+      configurable: true,
+      enumerable: true,
+      get: function () { return null; },
+      set: function (_) { /* ignore */ }
+    });
+    // DOM level on* on document too
+    Object.defineProperty(document, 'onbeforeprint', {
+      configurable: true,
+      enumerable: true,
+      get: function () { return null; },
+      set: function (_) { /* ignore */ }
+    });
+    Object.defineProperty(document, 'onafterprint', {
+      configurable: true,
+      enumerable: true,
+      get: function () { return null; },
+      set: function (_) { /* ignore */ }
+    });
+  } catch (e) {
+    // Some pages/contexts may disallow redefining; ignore failures.
+  }
+
+  // --- Neutralize addEventListener for beforeprint / afterprint on Window/EventTarget ---
+  const originalAdd = EventTarget.prototype.addEventListener;
+  const originalRemove = EventTarget.prototype.removeEventListener;
+
+  EventTarget.prototype.addEventListener = function (type, listener, options) {
+    // drop beforeprint/afterprint listeners
+    if (type === 'beforeprint' || type === 'afterprint') {
+      return;
+    }
+
+    // For key events, wrap the listener so it never sees print-key combos
+    if ((type === 'keydown' || type === 'keyup' || type === 'keypress') && typeof listener === 'function') {
+      const wrapped = function (e) {
+        try {
+          const key = e.key || '';
+          const code = e.keyCode || e.which || 0;
+          const isCtrlPCmdP = (e.ctrlKey || e.metaKey) && (key === 'p' || key === 'P' || code === 80);
+          const isPrintScreen = key === 'PrintScreen' || code === 44;
+          if (isCtrlPCmdP || isPrintScreen) {
+            e.stopImmediatePropagation();
+            return;
+          }
+        } catch (err) { /* ignore */ }
+        return listener.call(this, e);
+      };
+      // store a link so removeEventListener still works if page tries
+      try {
+        if (!this.__print_block_wrapped) this.__print_block_wrapped = new WeakMap();
+        this.__print_block_wrapped.set(listener, wrapped);
+      } catch (err) { /* ignore */ }
+      return originalAdd.call(this, type, wrapped, options);
+    }
+
+    return originalAdd.call(this, type, listener, options);
+  };
+
+  EventTarget.prototype.removeEventListener = function (type, listener, options) {
+    if ((type === 'keydown' || type === 'keyup' || type === 'keypress') && typeof listener === 'function') {
+      try {
+        if (this.__print_block_wrapped && this.__print_block_wrapped.get) {
+          const wrapped = this.__print_block_wrapped.get(listener);
+          if (wrapped) return originalRemove.call(this, type, wrapped, options);
+        }
+      } catch (err) { /* ignore */ }
+    }
+    return originalRemove.call(this, type, listener, options);
+  };
+
+  // --- Neutralize window.matchMedia('print') used by some sites ---
+  try {
+    const realMatchMedia = window.matchMedia.bind(window);
+    window.matchMedia = function (query) {
+      // if they're asking about 'print' pretend it never matches and give inert handlers
+      if (typeof query === 'string' && /print/i.test(query)) {
+        return {
+          matches: false,
+          media: query,
+          onchange: null,
+          addListener: function () { /* no-op */ },
+          removeListener: function () { /* no-op */ },
+          addEventListener: function () { /* no-op */ },
+          removeEventListener: function () { /* no-op */ },
+          dispatchEvent: function () { return false; }
+        };
+      }
+      return realMatchMedia(query);
+    };
+  } catch (e) {
+    // ignore if not allowed
+  }
+
+  // --- Optionally hide visibility changes triggered by print preview ---
+  // Many sites rely on visibilitychange to detect print-preview; we can intercept it:
+  // Add a capture-phase listener that blocks visibilitychange while printing (best-effort).
+  document.addEventListener('visibilitychange', function (e) {
+    try {
+      // if document.visibilityState changed to 'hidden' but there is no real reason, block it from reaching site listeners
+      // We'll stop propagation for short-lived hidden events that correlate with print:
+      if (document.visibilityState === 'hidden') {
+        e.stopImmediatePropagation();
+      }
+    } catch (err) { /* ignore */ }
+  }, true);
+
+  // --- Clear inline on* attributes potentially set in HTML that detect keys ---
+  // Best-effort: iterate and null out onkeydown/onkeyup handlers on common nodes
+  function scrubInlineHandlers() {
+    try {
+      const nodes = document.querySelectorAll('*');
+      for (let i = 0; i < nodes.length; i++) {
+        try {
+          if ('onkeydown' in nodes[i]) nodes[i].onkeydown = null;
+          if ('onkeyup' in nodes[i]) nodes[i].onkeyup = null;
+        } catch (inner) { /* ignore */ }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // Run once at start and again after load (some pages add inline handlers later)
+  scrubInlineHandlers();
+  window.addEventListener('load', function () { setTimeout(scrubInlineHandlers, 200); }, false);
+
+  // Small debug log (can be removed)
+  // console.info('Print-detection blockers installed.');
+})();
